@@ -1,4 +1,4 @@
-# RAG Incident Response Assistant
+# RAG Incident Response Assistant (part of teaching practice)
 
 Built as part of the YouTube series "Production AI Engineering from Scratch".
 Every line of code in this repo is explained in detail in the video.
