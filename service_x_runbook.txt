@@ -1,0 +1,98 @@
+SERVICE X — INCIDENT RUNBOOK
+Last Updated: 2024-11-01
+Owner: Platform Infrastructure Team
+
+=======================================================
+SECTION 1: SERVICE OVERVIEW
+=======================================================
+
+Service X is the primary API gateway for all internal microservices.
+It handles authentication, rate limiting, and request routing.
+It runs on port 8080 and communicates with downstream services via gRPC on port 9090.
+Service X depends on Redis for session caching and PostgreSQL for persistent auth tokens.
+
+=======================================================
+SECTION 2: CONNECTION REFUSED ERRORS
+=======================================================
+
+Symptom: Clients receive "connection refused" on port 8080.
+
+Root Cause 1 — Service X process crashed:
+  - Check if the process is running: `systemctl status service-x`
+  - If inactive: `journalctl -u service-x -n 100` to view last 100 log lines
+  - Common cause: out-of-memory kill. Check: `dmesg | grep -i oom`
+  - Fix: `systemctl restart service-x`
+  - If restart fails repeatedly, escalate to Tier 2.
+
+Root Cause 2 — Redis connection pool exhausted:
+  - Symptom: Service X logs show "Redis: max connections reached"
+  - Check Redis connections: `redis-cli info clients | grep connected_clients`
+  - If connected_clients > 500, flush idle connections: `redis-cli client kill skipme yes ID 0 ADDR 0.0.0.0:0 MAXAGE 300`
+  - Increase pool size in config if recurring: set REDIS_MAX_CONNECTIONS=1000 in /etc/service-x/env
+
+Root Cause 3 — Port conflict:
+  - Another process may have taken port 8080.
+  - Check: `ss -tlnp | grep 8080`
+  - If a different PID is shown, identify it: `ps aux | grep <PID>`
+  - Kill the conflicting process and restart Service X.
+
+=======================================================
+SECTION 3: HIGH LATENCY (P99 > 2 seconds)
+=======================================================
+
+Symptom: Requests complete but slowly. Alerts fire on p99 latency.
+
+Step 1 — Check downstream gRPC services:
+  - Run: `grpc_health_probe -addr=:9090`
+  - If unhealthy, the bottleneck is downstream, not Service X itself.
+  - Escalate to the team owning the slow downstream service.
+
+Step 2 — Check PostgreSQL query performance:
+  - Connect: `psql -U service_x_user -d authdb`
+  - Run: `SELECT query, mean_exec_time FROM pg_stat_statements ORDER BY mean_exec_time DESC LIMIT 10;`
+  - If any query exceeds 500ms average, a missing index or lock contention is likely.
+  - Common fix: `REINDEX TABLE auth_tokens;`
+
+Step 3 — Check CPU throttling:
+  - Run: `top -b -n 1 | grep service-x`
+  - If CPU% is consistently near 100%, the pod/VM may be throttled.
+  - Scale horizontally or increase CPU limits in the deployment config.
+
+=======================================================
+SECTION 4: AUTH TOKEN FAILURES
+=======================================================
+
+Symptom: Valid users receiving 401 Unauthorized errors intermittently.
+
+Cause 1 — Clock skew between nodes:
+  - JWT tokens are time-sensitive. If server clock drifts > 30 seconds, tokens appear expired.
+  - Check: `timedatectl status` on affected nodes
+  - Fix: `sudo systemctl restart systemd-timesyncd`
+
+Cause 2 — PostgreSQL auth_tokens table lock:
+  - Symptom: DB logs show lock wait timeouts on auth_tokens.
+  - Check: `SELECT * FROM pg_locks WHERE NOT granted;`
+  - If rows appear, a long-running transaction is blocking writes.
+  - Fix: `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE state = 'idle in transaction' AND query_start < NOW() - INTERVAL '5 minutes';`
+
+Cause 3 — Redis cache invalidation bug (known issue, v2.3.1 only):
+  - If Service X version is 2.3.1, tokens may be evicted prematurely.
+  - Workaround: Set TOKEN_CACHE_TTL=0 in /etc/service-x/env to disable caching temporarily.
+  - Permanent fix: upgrade to v2.3.2 or later.
+
+=======================================================
+SECTION 5: ESCALATION MATRIX
+=======================================================
+
+Tier 1 (On-call SRE):
+  - Handle: process restarts, Redis flushes, clock sync, known workarounds
+  - Resolve within: 15 minutes
+
+Tier 2 (Platform Engineering):
+  - Handle: DB schema issues, unknown crashes, deployment config changes
+  - Page via: PagerDuty escalation policy "platform-eng-oncall"
+  - Resolve within: 45 minutes
+
+Tier 3 (Engineering Lead + Vendor Support):
+  - Handle: data corruption, security incidents, SLA breaches
+  - Contact: engineering-lead@company.com + open vendor ticket

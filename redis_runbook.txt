@@ -1,0 +1,93 @@
+REDIS CACHE — INCIDENT RUNBOOK
+Last Updated: 2024-09-20
+Owner: Platform Infrastructure Team
+
+=======================================================
+SECTION 1: REDIS OVERVIEW
+=======================================================
+
+Redis runs as a single primary instance on redis.internal (192.168.1.20), port 6379.
+It is used for: session caching, rate limiting counters, and distributed locks.
+Max memory: 8GB with eviction policy: allkeys-lru
+Persistence: RDB snapshots every 15 minutes + AOF with everysec fsync
+
+=======================================================
+SECTION 2: REDIS DOWN / NOT RESPONDING
+=======================================================
+
+Symptom: Applications report Redis connection timeouts or refused connections.
+
+Step 1 — Check Redis process:
+  - `systemctl status redis`
+  - If not running: `journalctl -u redis -n 200` to check why it stopped.
+
+Step 2 — Common crash cause — OOM kill:
+  - `dmesg | grep -i "redis"`
+  - If OOM kill found, Redis exceeded system memory (not just its maxmemory setting).
+  - Check actual memory used: `redis-cli info memory | grep used_memory_human`
+  - Temporary fix: restart Redis with `systemctl start redis`
+  - Permanent fix: reduce maxmemory or upgrade instance.
+
+Step 3 — Check Redis logs directly:
+  - `tail -n 200 /var/log/redis/redis-server.log`
+  - Look for: "Can't save in background: fork: Cannot allocate memory"
+    - This means Redis can't fork for RDB snapshot. Disable RDB temporarily:
+    - `redis-cli config set save ""`
+
+=======================================================
+SECTION 3: HIGH MEMORY USAGE
+=======================================================
+
+Symptom: Redis memory usage alert fires (> 7GB used).
+
+Step 1 — Check memory breakdown:
+  - `redis-cli info memory`
+  - Key fields: used_memory_human, mem_fragmentation_ratio
+  - If fragmentation ratio > 1.5, memory is fragmented. Fix: `redis-cli memory purge`
+
+Step 2 — Find large keys:
+  - `redis-cli --bigkeys`
+  - This scans all keys and reports the largest per type. Do NOT run during peak traffic — it's slow.
+  - Off-peak only.
+
+Step 3 — Check TTL discipline:
+  - `redis-cli info keyspace`
+  - If a large DB has 0 expires, keys are never evicting. Review which service is writing without TTLs.
+  - Sample random keys: `redis-cli --scan --pattern "*" | head -20 | xargs -I{} redis-cli ttl {}`
+
+=======================================================
+SECTION 4: CACHE STAMPEDE
+=======================================================
+
+Symptom: After a Redis restart, application latency spikes for 2-5 minutes then recovers.
+
+Cause: All cached keys expired simultaneously. Every request goes to DB at the same time.
+
+Immediate mitigation:
+  - Throttle inbound traffic at the load balancer to reduce DB pressure.
+  - Manually warm critical keys if possible.
+
+Prevention (for next time):
+  - Use jittered TTLs: instead of TTL=300 for all keys, use TTL = 300 + random(0,60)
+  - This staggers expiration so not all keys expire at the same moment.
+
+=======================================================
+SECTION 5: DISTRIBUTED LOCK ISSUES
+=======================================================
+
+Symptom: Jobs report "could not acquire lock" even when no other job is running.
+
+Cause: A lock was set but never released (e.g. the holding process crashed mid-job).
+
+Check for stale locks:
+  - `redis-cli keys "lock:*"` — lists all lock keys
+  - `redis-cli ttl "lock:job_name"` — if -1, no TTL, lock is stuck forever
+
+Fix:
+  - `redis-cli del "lock:job_name"` — manually release the stuck lock
+
+Prevention:
+  - All locks MUST be set with a TTL: `SET lock:job_name 1 EX 300 NX`
+  - EX 300 = expire in 300 seconds
+  - NX = only set if not exists
+  - Never use SET + EXPIRE as two separate commands (race condition possible).

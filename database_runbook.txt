@@ -1,0 +1,101 @@
+POSTGRESQL DATABASE — INCIDENT RUNBOOK
+Last Updated: 2024-10-15
+Owner: Data Infrastructure Team
+
+=======================================================
+SECTION 1: DATABASE OVERVIEW
+=======================================================
+
+The production PostgreSQL cluster runs on version 15.3.
+Primary node: db-primary.internal (192.168.1.10)
+Replica nodes: db-replica-1.internal, db-replica-2.internal
+Port: 5432
+Max connections: 200 (set in postgresql.conf)
+Backup schedule: daily at 02:00 UTC via pgdump to S3 bucket prod-db-backups
+
+=======================================================
+SECTION 2: CONNECTION LIMIT EXCEEDED
+=======================================================
+
+Symptom: New connections fail with "FATAL: remaining connection slots are reserved for replication"
+
+Step 1 — Check current connections:
+  - `SELECT count(*), state FROM pg_stat_activity GROUP BY state;`
+  - If idle connections are high (>150), a connection pool leak is likely.
+
+Step 2 — Terminate idle connections:
+  - `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE state = 'idle' AND query_start < NOW() - INTERVAL '10 minutes';`
+
+Step 3 — If PgBouncer is in use, restart it:
+  - `sudo systemctl restart pgbouncer`
+  - Check its pool stats: `psql -p 6432 -U pgbouncer pgbouncer -c "SHOW POOLS;"`
+
+Step 4 — Emergency: increase max_connections temporarily:
+  - Edit /etc/postgresql/15/main/postgresql.conf
+  - Set max_connections = 300
+  - Reload (no restart needed): `SELECT pg_reload_conf();`
+  - NOTE: this is a temporary fix. Root cause must be addressed.
+
+=======================================================
+SECTION 3: REPLICATION LAG
+=======================================================
+
+Symptom: Reads from replica return stale data. Alerts on replication_lag > 30 seconds.
+
+Check lag on primary:
+  - `SELECT client_addr, state, sent_lsn, write_lsn, flush_lsn, replay_lsn, (sent_lsn - replay_lsn) AS replication_lag FROM pg_stat_replication;`
+
+Cause 1 — Network congestion:
+  - High WAL volume during bulk operations can saturate the replication channel.
+  - Check network throughput between primary and replica.
+  - Pause any bulk inserts/updates if possible until lag recovers.
+
+Cause 2 — Replica CPU/IO overloaded:
+  - If the replica is serving heavy read traffic, WAL replay falls behind.
+  - Temporarily redirect read traffic to primary by updating the app read DSN.
+  - Scale up replica instance or add a third replica.
+
+Cause 3 — Replica fell too far behind (> 1GB WAL):
+  - If the replica has fallen too far behind, it may need to be rebuilt.
+  - On the replica: `pg_basebackup -h db-primary.internal -U replication -D /var/lib/postgresql/15/main --wal-method=stream --checkpoint=fast`
+
+=======================================================
+SECTION 4: DISK SPACE CRITICAL
+=======================================================
+
+Symptom: Disk usage > 85% alert fires on database volume.
+
+Step 1 — Find largest tables:
+  - `SELECT relname, pg_size_pretty(pg_total_relation_size(relid)) FROM pg_catalog.pg_statio_user_tables ORDER BY pg_total_relation_size(relid) DESC LIMIT 10;`
+
+Step 2 — Check for bloat (dead tuples):
+  - `SELECT relname, n_dead_tup, n_live_tup FROM pg_stat_user_tables ORDER BY n_dead_tup DESC LIMIT 10;`
+  - If dead tuples are high on large tables, run: `VACUUM ANALYZE <tablename>;`
+
+Step 3 — Check WAL accumulation:
+  - `du -sh /var/lib/postgresql/15/main/pg_wal/`
+  - If large, a replication slot may be holding WAL. Check: `SELECT slot_name, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) FROM pg_replication_slots;`
+  - If a stale slot is found and replication is confirmed healthy, drop it: `SELECT pg_drop_replication_slot('slot_name');`
+
+=======================================================
+SECTION 5: SLOW QUERIES
+=======================================================
+
+Symptom: Application latency spikes. DB CPU high.
+
+Enable slow query logging (if not already enabled):
+  - In postgresql.conf: log_min_duration_statement = 1000  (logs queries > 1 second)
+  - Reload: `SELECT pg_reload_conf();`
+
+Find running slow queries:
+  - `SELECT pid, now() - pg_stat_activity.query_start AS duration, query, state FROM pg_stat_activity WHERE state != 'idle' AND now() - pg_stat_activity.query_start > INTERVAL '5 seconds' ORDER BY duration DESC;`
+
+Kill a slow query:
+  - `SELECT pg_cancel_backend(<pid>);`   -- sends SIGINT, graceful
+  - `SELECT pg_terminate_backend(<pid>);` -- sends SIGTERM, forceful
+
+Common fix — missing index:
+  - Use EXPLAIN ANALYZE to identify sequential scans on large tables.
+  - `EXPLAIN ANALYZE SELECT * FROM auth_tokens WHERE user_id = 12345;`
+  - If Seq Scan appears: `CREATE INDEX CONCURRENTLY idx_auth_tokens_user_id ON auth_tokens(user_id);`
+  - CONCURRENTLY avoids locking the table during index creation.
